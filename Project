@@ -1,0 +1,307 @@
+# 0) Standard imports
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from sklearn.preprocessing import MinMaxScaler
+import shap
+from statsmodels.tsa.arima.model import ARIMA
+# prophet import (optional)
+try:
+    from prophet import Prophet
+except Exception as e:
+    print("Prophet import failed (optional).", e)
+
+print("GPU available:", tf.config.list_physical_devices('GPU'))
+
+# --------------------------
+# 1) Load dataset (single, cleaned block)
+# --------------------------
+DATA_PATH = "electricity.csv"
+
+if not os.path.exists(DATA_PATH):
+    print("No local electricity.csv found. Creating synthetic placeholder dataset.")
+    rng = pd.date_range(start="2012-01-01", periods=24*365, freq="H")
+    np.random.seed(0)
+    load = 200 + 50*np.sin(np.arange(len(rng)) * 2*np.pi/24) + 5*np.random.randn(len(rng))
+    temp = 15 + 10*np.sin(np.arange(len(rng)) * 2*np.pi/(24*365)) + 3*np.random.randn(len(rng))
+    weekday = rng.weekday
+    df = pd.DataFrame({"datetime": rng, "load": load, "temp": temp, "weekday": weekday})
+    df.to_csv(DATA_PATH, index=False)
+    print("Synthetic dataset saved to", DATA_PATH)
+else:
+    df = pd.read_csv(DATA_PATH, parse_dates=['datetime'] if 'datetime' in pd.read_csv(DATA_PATH, nrows=1).columns else None)
+    if 'datetime' not in df.columns:
+        df.columns = ['datetime'] + list(df.columns[1:])
+    print("Loaded", DATA_PATH)
+
+# load CSV and set datetime index
+df = pd.read_csv(DATA_PATH, parse_dates=['datetime'])
+df = df.set_index('datetime').sort_index()
+print("Data snapshot:")
+print(df.head())
+
+# --------------------------
+# 2) Config: sequence lengths and target
+# --------------------------
+INPUT_STEPS = 24 * 7      # use 7 days of hourly history
+OUTPUT_STEPS = 24         # predict next 24 hours
+TARGET_COL = 'load'
+
+# --------------------------
+# 3) Prepare sequences (multivariate)
+# --------------------------
+def make_sequences(df, input_steps, output_steps, target_col, feature_cols=None):
+    """
+    df: DataFrame indexed by datetime, sorted
+    returns: X (num_samples, input_steps, num_features), y (num_samples, output_steps)
+    """
+    if feature_cols is None:
+        feature_cols = df.columns.tolist()
+    data = df[feature_cols].values
+    n = len(df)
+    X, y = [], []
+    for i in range(n - input_steps - output_steps + 1):
+        x = data[i: i + input_steps]
+        y_seq = data[i + input_steps: i + input_steps + output_steps]
+        # target column is first extracted from y_seq
+        X.append(x)
+        y.append(y_seq[:, feature_cols.index(target_col)])  # shape (output_steps,)
+    return np.array(X), np.array(y)
+
+# Choose feature columns: include target + exogenous (temp, weekday) if available
+feature_cols = [c for c in df.columns if c in ['load', 'temp', 'weekday']]
+if 'load' not in feature_cols:
+    raise ValueError("Data must contain 'load' column.")
+
+# drop NA rows for safety
+df = df[feature_cols].dropna()
+
+# build sequences
+X_all, y_all = make_sequences(df, INPUT_STEPS, OUTPUT_STEPS, target_col=TARGET_COL, feature_cols=feature_cols)
+print("Sequences shapes X_all, y_all:", X_all.shape, y_all.shape)
+
+# --------------------------
+# 4) Train/test split + scaling
+# --------------------------
+split = int(0.8 * len(X_all))
+X_train, X_test = X_all[:split], X_all[split:]
+y_train, y_test = y_all[:split], y_all[split:]
+
+# Fit scaler on flattened features (to scale feature-wise)
+num_features = X_train.shape[2]
+scaler = MinMaxScaler()
+# fit on training data reshaped to (n_samples * steps, features)
+scaler.fit(X_train.reshape(-1, num_features))
+
+# transform X
+X_train_scaled = scaler.transform(X_train.reshape(-1, num_features)).reshape(X_train.shape)
+X_test_scaled  = scaler.transform(X_test.reshape(-1, num_features)).reshape(X_test.shape)
+
+# For y (targets), we will scale via the same scaler by transforming the single-feature column:
+def scale_y(y_seq, scaler, target_index=0):
+    # y_seq shape: (n_samples, output_steps)
+    n, h = y_seq.shape
+    # stack to shape (n*h, num_features) where we place target in first column and zeros for others,
+    # then inverse/transform via scaler for consistent scaling
+    pad = np.zeros((n*h, scaler.n_features_in_ - 1))
+    stacked = np.concatenate([y_seq.reshape(-1,1), pad], axis=1)
+    scaled = scaler.transform(stacked)[:, 0].reshape(n, h)
+    return scaled
+
+y_train_scaled = scale_y(y_train, scaler)
+y_test_scaled  = scale_y(y_test, scaler)
+
+print("Shapes after scaling:", X_train_scaled.shape, y_train_scaled.shape, X_test_scaled.shape, y_test_scaled.shape)
+
+# --------------------------
+# 5) Define Attention & Seq2Seq (Keras)  -- fixed small bugs
+# --------------------------
+class Attention(layers.Layer):
+    def __init__(self, units):
+        super().__init__()
+        self.W1 = layers.Dense(units)
+        self.W2 = layers.Dense(units)
+        self.V  = layers.Dense(1)
+    def call(self, encoder_output, decoder_hidden):
+        # encoder_output: (batch, time, features)
+        # decoder_hidden: (batch, units)
+        score = self.V(tf.nn.tanh(self.W1(encoder_output) + tf.expand_dims(self.W2(decoder_hidden), 1)))
+        weights = tf.nn.softmax(score, axis=1)  # (batch, time, 1)
+        context = tf.reduce_sum(weights * encoder_output, axis=1)  # (batch, features)
+        return context, tf.squeeze(weights, -1)  # weights -> (batch, time)
+
+class Seq2Seq(Model):
+    def __init__(self, latent_dim, output_steps, num_features):
+        super().__init__()
+        self.encoder_lstm = layers.LSTM(latent_dim, return_sequences=True, return_state=True)
+        # decoder processes one timestep at a time (no return_sequences)
+        self.decoder_lstm = layers.LSTM(latent_dim, return_state=True)
+        self.attention = Attention(latent_dim)
+        self.dense = layers.Dense(1)  # predicting the target value (load)
+        self.output_steps = output_steps
+        self.num_features = num_features
+
+    def call(self, inputs, training=False):
+        # inputs: (batch, time, features)
+        enc_out, h, c = self.encoder_lstm(inputs, training=training)
+        decoder_hidden = h
+        decoder_state = c
+        # start token: zeros of shape (batch, features)
+        decoder_input = tf.zeros((tf.shape(inputs)[0], self.num_features))
+        outputs = []
+        for t in range(self.output_steps):
+            context, _attn = self.attention(enc_out, decoder_hidden)
+            # combine context and decoder input (result shape (batch, 1, features_context+num_features))
+            x = tf.concat([tf.expand_dims(context, 1), tf.expand_dims(decoder_input, 1)], axis=-1)
+            # one-step decode
+            lstm_out, decoder_hidden, decoder_state = self.decoder_lstm(x, initial_state=[decoder_hidden, decoder_state], training=training)
+            pred = self.dense(lstm_out)           # (batch, 1)
+            pred = tf.squeeze(pred, axis=1)      # -> (batch,)
+            outputs.append(pred)
+            # next decoder input: predicted value in first feature position, zeros for others
+            next_input = tf.concat([tf.expand_dims(pred, -1), tf.zeros((tf.shape(pred)[0], self.num_features-1))], axis=1)
+            decoder_input = next_input
+        # stack outputs -> (batch, output_steps)
+        return tf.stack(outputs, axis=1)
+
+# --------------------------
+# 6) Instantiate & compile
+# --------------------------
+latent_dim = 64
+model = Seq2Seq(latent_dim=latent_dim, output_steps=OUTPUT_STEPS, num_features=num_features)
+model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+# build with a concrete input shape for a summary
+model.build(input_shape=(None, INPUT_STEPS, num_features))
+model.summary()
+
+# --------------------------
+# 7) Train (quick demo)
+# --------------------------
+EPOCHS = 8
+BATCH = 64
+
+# Note: model expects inputs shaped (batch, steps, features) and y as (batch, output_steps)
+history = model.fit(X_train_scaled, y_train_scaled, validation_split=0.1, epochs=EPOCHS, batch_size=BATCH)
+
+plt.figure()
+plt.plot(history.history['loss'], label='train')
+plt.plot(history.history['val_loss'], label='val')
+plt.legend(); plt.title("Loss")
+
+# --------------------------
+# 8) Rolling forecast (walk-forward) and inverse scaling helper
+# --------------------------
+def rolling_forecast(model, X_scaled):
+    preds = []
+    for i in range(len(X_scaled)):
+        p = model.predict(X_scaled[i:i+1], verbose=0)[0]  # (output_steps,)
+        preds.append(p)
+    return np.array(preds)  # (n_samples, output_steps)
+
+def inv_scale_preds(preds_scaled, scaler):
+    # preds_scaled: (n_samples, output_steps) in scaled target range
+    n_samples, horizon = preds_scaled.shape
+    out = np.zeros_like(preds_scaled)
+    for i in range(n_samples):
+        preds = preds_scaled[i].reshape(-1,1)
+        pad = np.zeros((horizon, scaler.n_features_in_ - 1))
+        stacked = np.concatenate([preds, pad], axis=1)
+        inv = scaler.inverse_transform(stacked)[:, 0]
+        out[i] = inv
+    return out
+
+preds_scaled = rolling_forecast(model, X_test_scaled)
+print("Preds_scaled shape:", preds_scaled.shape)
+preds = inv_scale_preds(preds_scaled, scaler)
+y_true = inv_scale_preds(y_test_scaled, scaler)
+print("Pred shape (inverted):", preds.shape)
+
+# --------------------------
+# 9) Evaluate & plot a sample window
+# --------------------------
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+mae = mean_absolute_error(y_true.flatten(), preds.flatten())
+rmse = np.sqrt(mean_squared_error(y_true.flatten(), preds.flatten()))
+print("MAE:", mae, "RMSE:", rmse)
+
+# plot one example
+idx = min(5, len(preds)-1)
+plt.figure(figsize=(10,4))
+plt.plot(range(OUTPUT_STEPS), y_true[idx], marker='o', label='true')
+plt.plot(range(OUTPUT_STEPS), preds[idx], marker='x', label='pred')
+plt.legend(); plt.title(f"Forecast sample #{idx}")
+
+# --------------------------
+# 10) SHAP explainability for a single horizon step (KernelExplainer)
+# --------------------------
+HORIZON_TO_EXPLAIN = 0
+
+# Background and sample (must match flattened shape expected by explainer function)
+background = X_train_scaled[:30].reshape(30, -1)
+sample_for_explain = X_test_scaled[:5].reshape(5, -1)
+
+def predict_single_horizon(flat_inputs):
+    """
+    flat_inputs: shape (batch, input_steps * num_features)
+    returns predictions for HORIZON_TO_EXPLAIN: shape (batch,)
+    """
+    batch = flat_inputs.shape[0]
+    reshaped = flat_inputs.reshape(batch, INPUT_STEPS, num_features)
+    preds = model.predict(reshaped, verbose=0)  # -> (batch, OUTPUT_STEPS)
+    return preds[:, HORIZON_TO_EXPLAIN]
+
+print("Building SHAP KernelExplainer... (this may take some time)")
+explainer = shap.KernelExplainer(predict_single_horizon, background)
+print("Computing SHAP values on samples...")
+shap_values = explainer.shap_values(sample_for_explain)  # list or array (batch, features_total)
+print("SHAP ready. Plotting summary...")
+shap.initjs()
+# feature names: we flatten time x features to names like "t-23_load", ...
+fnames = []
+for t in range(INPUT_STEPS):
+    for f in feature_cols:
+        fnames.append(f"t-{INPUT_STEPS-1-t}_{f}")
+shap.summary_plot(shap_values, sample_for_explain, feature_names=fnames)
+
+# --------------------------
+# 11) Baselines: ARIMA & Prophet (daily aggregated series)
+# --------------------------
+print("\n--- Baselines: ARIMA and Prophet on daily series ---")
+# prepare daily series
+series = df['load'].resample('D').mean().dropna()
+train_len = int(0.8 * len(series))
+train_s = series.iloc[:train_len]
+test_s  = series.iloc[train_len:]
+print("Daily series lengths, train/test:", len(train_s), len(test_s))
+
+# ARIMA baseline
+try:
+    arima_model = ARIMA(train_s, order=(2,1,2)).fit()
+    fc = arima_model.forecast(len(test_s))
+    arima_mae = mean_absolute_error(test_s.values, fc.values)
+    print("ARIMA MAE:", arima_mae)
+except Exception as e:
+    print("ARIMA Error:", e)
+
+# Prophet baseline
+try:
+    df_prop = series.reset_index()
+    df_prop.columns = ["ds", "y"]
+    df_prop["ds"] = pd.to_datetime(df_prop["ds"], errors="coerce")
+    df_prop = df_prop.dropna()
+    train_prop = df_prop.iloc[:train_len]
+    test_prop  = df_prop.iloc[train_len:]
+    m = Prophet()
+    m.fit(train_prop)
+    future = m.make_future_dataframe(periods=len(test_prop), freq='D')
+    forecast = m.predict(future)
+    fcst_test = forecast["yhat"].iloc[-len(test_prop):].values
+    prophet_mae = mean_absolute_error(test_prop["y"].values, fcst_test)
+    print("Prophet MAE:", prophet_mae)
+except Exception as e:
+    print("Prophet Error:", e)
+
+print("Done.")
